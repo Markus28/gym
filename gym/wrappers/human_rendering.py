@@ -1,8 +1,42 @@
 """A wrapper that adds human-renering functionality to an environment."""
+# from threading import Thread
+from multiprocessing import Manager, Process
+from queue import Queue
+
 import numpy as np
 
 import gym
 from gym.error import DependencyNotInstalled
+
+
+def render_frames_sync(q, size, fps):
+    try:
+        import pygame
+    except ImportError:
+        raise DependencyNotInstalled(
+            "pygame is not installed, run `pip install gym[box2d]`"
+        )
+    pygame.init()
+    pygame.display.init()
+    window = pygame.display.set_mode(size[::-1])
+    clock = pygame.time.Clock()
+
+    while True:
+        frame = q.get()
+
+        if frame is None:
+            print("Finishing")
+            pygame.display.quit()
+            pygame.quit()
+            print("Done")
+            return
+
+        frame = np.transpose(frame, axes=(1, 0, 2))
+        surf = pygame.surfarray.make_surface(frame)
+        window.blit(surf, (0, 0))
+        pygame.event.pump()
+        clock.tick(fps)
+        pygame.display.flip()
 
 
 class HumanRendering(gym.Wrapper):
@@ -46,6 +80,7 @@ class HumanRendering(gym.Wrapper):
             env: The environment that is being wrapped
         """
         super().__init__(env, new_step_api=True)
+        self._is_open = True
         assert env.render_mode in [
             "single_rgb_array",
             "rgb_array",
@@ -55,8 +90,9 @@ class HumanRendering(gym.Wrapper):
         ), "The base environment must specify 'render_fps' to be used with the HumanRendering wrapper"
 
         self.screen_size = None
-        self.window = None
-        self.clock = None
+        self.manager = Manager()
+        self.frame_queue = self.manager.Queue(maxsize=5)
+        self.t = None
 
     @property
     def render_mode(self):
@@ -81,12 +117,6 @@ class HumanRendering(gym.Wrapper):
 
     def _render_frame(self, mode="human", **kwargs):
         """Fetch the last frame from the base environment and render it to the screen."""
-        try:
-            import pygame
-        except ImportError:
-            raise DependencyNotInstalled(
-                "pygame is not installed, run `pip install gym[box2d]`"
-            )
         if self.env.render_mode == "rgb_array":
             last_rgb_array = self.env.render(**kwargs)
             assert isinstance(last_rgb_array, list)
@@ -100,36 +130,32 @@ class HumanRendering(gym.Wrapper):
         assert isinstance(last_rgb_array, np.ndarray)
 
         if mode == "human":
-            rgb_array = np.transpose(last_rgb_array, axes=(1, 0, 2))
+            if self.t is None:
+                # self.t = Thread(target=render_frames_sync, args=(self.frame_queue, last_rgb_array.shape[:-1], self.env.metadata["render_fps"]))
+                self.t = Process(
+                    target=render_frames_sync,
+                    args=(
+                        self.frame_queue,
+                        last_rgb_array.shape[:-1],
+                        self.env.metadata["render_fps"],
+                    ),
+                )
+                self.t.start()
 
-            if self.screen_size is None:
-                self.screen_size = rgb_array.shape[:2]
-
-            assert (
-                self.screen_size == rgb_array.shape[:2]
-            ), f"The shape of the rgb array has changed from {self.screen_size} to {rgb_array.shape[:2]}"
-
-            if self.window is None:
-                pygame.init()
-                pygame.display.init()
-                self.window = pygame.display.set_mode(self.screen_size)
-
-            if self.clock is None:
-                self.clock = pygame.time.Clock()
-
-            surf = pygame.surfarray.make_surface(rgb_array)
-            self.window.blit(surf, (0, 0))
-            pygame.event.pump()
-            self.clock.tick(self.metadata["render_fps"])
-            pygame.display.flip()
+            self.frame_queue.put(last_rgb_array)
         else:
             raise Exception("Can only use 'human' rendering in HumanRendering wrapper")
 
     def close(self):
         """Close the rendering window."""
+        self._is_open = False
+        # super().close()
+        self.frame_queue.put(None)
+        if self.t is not None and self.t.is_alive():
+            self.frame_queue.put(None)
+            self.t.join()
         super().close()
-        if self.window is not None:
-            import pygame
 
-            pygame.display.quit()
-            pygame.quit()
+    def __del__(self):
+        if self._is_open:
+            self.close()
